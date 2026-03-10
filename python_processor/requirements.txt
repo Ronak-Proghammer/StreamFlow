@@ -1,0 +1,3 @@
+psycopg2-binary==2.9.9   # PostgreSQL driver for Python
+APScheduler==3.10.4      # Job scheduler (runs aggregations every N seconds)
+python-dotenv==1.0.0     # Environment variable loading

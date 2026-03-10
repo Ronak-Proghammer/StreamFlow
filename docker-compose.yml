@@ -1,0 +1,196 @@
+version: "3.9"
+
+# ============================================================
+# STREAMFLOW — Docker Compose
+# ============================================================
+# This file defines every service in our system and how they
+# connect to each other. Think of it as the "blueprint" for
+# your entire local environment.
+#
+# Services:
+#   - rabbitmq     → message broker (event queue)
+#   - postgres     → persistent storage
+#   - elixir_app   → core backend (consumer + API)
+#   - python_producer   → generates fake events
+#   - python_processor  → runs aggregations
+# ============================================================
+
+services:
+
+  # ----------------------------------------------------------
+  # RABBITMQ
+  # ----------------------------------------------------------
+  # RabbitMQ is a message broker. Think of it as a post office:
+  # producers drop off letters (messages/events), and consumers
+  # pick them up. This decouples your services — the producer
+  # doesn't need to know or care who processes the event.
+  #
+  # We use the "management" image which includes a web UI at
+  # http://localhost:15672 (guest/guest) — very useful for
+  # debugging during development.
+  # ----------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: streamflow_rabbitmq
+    ports:
+      - "5672:5672"    # AMQP protocol port (apps connect here)
+      - "15672:15672"  # Management UI (browser)
+    environment:
+      RABBITMQ_DEFAULT_USER: streamflow
+      RABBITMQ_DEFAULT_PASS: streamflow_pass
+      RABBITMQ_DEFAULT_VHOST: streamflow_vhost
+    volumes:
+      # Persist RabbitMQ data so messages survive restarts
+      - rabbitmq_data:/var/lib/rabbitmq
+      # Custom config to tune performance
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    healthcheck:
+      # We check if RabbitMQ is actually ready to accept
+      # connections — not just that the container started.
+      # Other services will WAIT for this before starting.
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - streamflow_net
+
+  # ----------------------------------------------------------
+  # POSTGRESQL
+  # ----------------------------------------------------------
+  # Our persistent data store. Everything that gets processed
+  # ends up here. PostgreSQL is the gold standard for
+  # relational data — excellent for both transactional
+  # (OLTP) and analytical (OLAP) queries.
+  # ----------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: streamflow_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: streamflow
+      POSTGRES_PASSWORD: streamflow_pass
+      POSTGRES_DB: streamflow_dev
+    volumes:
+      # Persist DB data across container restarts
+      - postgres_data:/var/lib/postgresql/data
+      # Auto-run our schema SQL when the DB first starts
+      - ./postgres/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # pg_isready checks if postgres is accepting connections
+      test: ["CMD-SHELL", "pg_isready -U streamflow -d streamflow_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - streamflow_net
+
+  # ----------------------------------------------------------
+  # ELIXIR APP (Phoenix)
+  # ----------------------------------------------------------
+  # Our core backend. It:
+  #   1. Consumes events from RabbitMQ (via GenServer)
+  #   2. Writes events to PostgreSQL (via Ecto)
+  #   3. Exposes a REST API for analytics
+  #
+  # depends_on with condition: service_healthy means Docker
+  # will NOT start this until Postgres AND RabbitMQ are ready.
+  # This is critical — if Elixir starts before Postgres, it
+  # will crash trying to connect to a DB that isn't ready.
+  # ----------------------------------------------------------
+  elixir_app:
+    build:
+      context: ./elixir_app
+      dockerfile: Dockerfile
+    container_name: streamflow_elixir
+    ports:
+      - "4000:4000"  # Phoenix HTTP API
+    environment:
+      DATABASE_URL: postgres://streamflow:streamflow_pass@postgres:5432/streamflow_dev
+      RABBITMQ_URL: amqp://streamflow:streamflow_pass@rabbitmq:5672/streamflow_vhost
+      PHX_HOST: localhost
+      SECRET_KEY_BASE: "super_secret_key_base_replace_in_production_min_64_chars_long!!"
+      MIX_ENV: dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - streamflow_net
+    restart: on-failure  # Restart if it crashes (like a supervision tree at infra level)
+
+  # ----------------------------------------------------------
+  # PYTHON PRODUCER
+  # ----------------------------------------------------------
+  # Generates realistic fake events and publishes them to
+  # RabbitMQ. In a real system this would be your actual
+  # application sending events (user clicks, IoT sensors, etc.)
+  # ----------------------------------------------------------
+  python_producer:
+    build:
+      context: ./python_producer
+      dockerfile: Dockerfile
+    container_name: streamflow_producer
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: streamflow
+      RABBITMQ_PASS: streamflow_pass
+      RABBITMQ_VHOST: streamflow_vhost
+      EVENTS_PER_SECOND: 5
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - streamflow_net
+    restart: on-failure
+
+  # ----------------------------------------------------------
+  # PYTHON PROCESSOR
+  # ----------------------------------------------------------
+  # Runs scheduled aggregation jobs — reads raw events from
+  # PostgreSQL and computes analytics (counts, averages, etc.)
+  # Writes results to an aggregates table.
+  # ----------------------------------------------------------
+  python_processor:
+    build:
+      context: ./python_processor
+      dockerfile: Dockerfile
+    container_name: streamflow_processor
+    environment:
+      DATABASE_URL: postgresql://streamflow:streamflow_pass@postgres:5432/streamflow_dev
+      AGGREGATION_INTERVAL_SECONDS: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - streamflow_net
+    restart: on-failure
+
+# ============================================================
+# NETWORKS
+# ============================================================
+# We put all services on a private network so they can talk
+# to each other by container name (e.g. "postgres", "rabbitmq")
+# instead of IP addresses. This is how service discovery works
+# in Docker and Kubernetes.
+# ============================================================
+networks:
+  streamflow_net:
+    driver: bridge
+
+# ============================================================
+# VOLUMES
+# ============================================================
+# Named volumes persist data even when containers are stopped
+# or removed. Without this, you'd lose your DB every restart.
+# In production (Kubernetes), you'd use PersistentVolumeClaims
+# instead — same concept, different implementation.
+# ============================================================
+volumes:
+  postgres_data:
+  rabbitmq_data:
