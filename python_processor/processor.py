@@ -92,16 +92,16 @@ def run_hourly_aggregation():
             computed_at
         )
         SELECT
-            date_trunc('hour', occurred_at)               AS bucket_start,
+            date_trunc('hour', occurred_at) AS bucket_start,
             date_trunc('hour', occurred_at) + INTERVAL '1 hour' AS bucket_end,
-            'hour'                                         AS bucket_size,
+            'hour' AS bucket_size,
             event_type::text::event_type,
             source_service,
-            COUNT(*)                                       AS event_count,
-            COUNT(DISTINCT user_id)                        AS unique_users,
-            COUNT(DISTINCT session_id)                     AS unique_sessions,
-            COUNT(*) FILTER (WHERE event_type = 'error')   AS error_count,
-            NOW()                                          AS computed_at
+            COUNT(*) AS event_count,
+            COUNT(DISTINCT user_id) AS unique_users,
+            COUNT(DISTINCT session_id) AS unique_sessions,
+            COUNT(*) FILTER (WHERE event_type = 'error') AS error_count,
+            NOW() AS computed_at
         FROM events
         WHERE occurred_at >= NOW() - INTERVAL '2 hours'
           AND occurred_at < date_trunc('hour', NOW())
