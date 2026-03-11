@@ -35,7 +35,7 @@ ENV MIX_ENV=prod
 # Why? Docker caches layers. If we copy source first,
 # every code change invalidates the dependency cache.
 # This way, deps only re-download when mix.exs changes.
-COPY mix.exs mix.lock ./
+COPY mix.exs ./
 RUN mix deps.get --only prod
 RUN mix deps.compile
 

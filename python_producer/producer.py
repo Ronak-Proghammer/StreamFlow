@@ -2,16 +2,6 @@
 StreamFlow Event Producer
 =========================
 Generates realistic fake events and publishes them to RabbitMQ.
-
-In a real system, this would be replaced by actual application
-services (web frontend, mobile apps, etc.) that publish real
-user events. For our demo, we simulate that traffic.
-
-DESIGN PATTERN: Publisher/Producer
-- Does NOT know who will consume the events
-- Does NOT know what will happen to the events
-- Just puts them in the queue and moves on
-- This decoupling is the core value of message queues
 """
 
 import json
@@ -29,305 +19,252 @@ from faker import Faker
 
 fake = Faker()
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-# We read config from environment variables — never hardcode
-# credentials in source code. In production this would come
-# from a secrets manager (AWS Secrets Manager, Vault, etc.)
-# ============================================================
-RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
-RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
-RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
-RABBITMQ_PASS = os.getenv("RABBITMQ_PASS", "guest")
+RABBITMQ_HOST  = os.getenv("RABBITMQ_HOST", "localhost")
+RABBITMQ_PORT  = int(os.getenv("RABBITMQ_PORT", "5672"))
+RABBITMQ_USER  = os.getenv("RABBITMQ_USER", "guest")
+RABBITMQ_PASS  = os.getenv("RABBITMQ_PASS", "guest")
 RABBITMQ_VHOST = os.getenv("RABBITMQ_VHOST", "/")
 EVENTS_PER_SECOND = float(os.getenv("EVENTS_PER_SECOND", "2"))
 
-EXCHANGE = "streamflow.events"
-ROUTING_KEY = "events"
-
-# ============================================================
-# EVENT GENERATORS
-# ============================================================
-# We use a list of services and weighted event types to
-# simulate realistic traffic patterns.
-# Purchases are rare; page views are common.
-# This mimics real-world traffic distributions.
-# ============================================================
+# ─── Topology constants ────────────────────────────────────────────────────────
+# These MUST match exactly what the Elixir consumer expects
+# Both sides declare the same topology — safe because RabbitMQ
+# declare operations are idempotent (declaring twice = no error)
+EXCHANGE       = "streamflow.events"
+QUEUE          = "streamflow.events.queue"
+DEAD_LETTER_Q  = "streamflow.events.dead_letter"
+DEAD_LETTER_EX = "streamflow.events.dead_letter_exchange"
+ROUTING_KEY    = "events"
 
 SERVICES = [
-    "web-frontend",
-    "mobile-app",
-    "auth-service",
-    "payment-service",
-    "api-gateway",
-    "recommendation-service",
+  "web-frontend", "mobile-app", "auth-service",
+  "payment-service", "api-gateway", "recommendation-service",
 ]
 
-# Weighted choices — page_view happens most often
 EVENT_TYPES_WEIGHTED = [
-    ("page_view", 35),
-    ("button_click", 25),
-    ("api_call", 20),
-    ("user_login", 8),
-    ("user_logout", 5),
-    ("purchase", 4),
-    ("error", 2),
-    ("data_export", 1),
+  ("page_view",    35),
+  ("button_click", 25),
+  ("api_call",     20),
+  ("user_login",    8),
+  ("user_logout",   5),
+  ("purchase",      4),
+  ("error",         2),
+  ("data_export",   1),
 ]
-
-# Unpack for random.choices
-EVENT_TYPES = [e[0] for e in EVENT_TYPES_WEIGHTED]
+EVENT_TYPES   = [e[0] for e in EVENT_TYPES_WEIGHTED]
 EVENT_WEIGHTS = [e[1] for e in EVENT_TYPES_WEIGHTED]
 
 
-def generate_event_data(event_type: str, service: str) -> dict:
-    """
-    Generate realistic payload data for each event type.
-    
-    In a real system this data would come from the actual application.
-    Each event type has a different shape — this is why we use JSONB
-    in PostgreSQL (flexible schema).
-    """
-    base = {
-        "id": str(uuid.uuid4()),
-        "source_service": service,
-        "event_type": event_type,
-        "user_id": f"user_{random.randint(1, 200):04d}" if random.random() > 0.1 else None,
-        "session_id": f"sess_{uuid.uuid4().hex[:16]}",
-        "occurred_at": datetime.now(timezone.utc).isoformat(),
-        "client_ip": fake.ipv4(),
-    }
+def generate_event(event_type: str, service: str) -> dict:
+  base = {
+    "id":             str(uuid.uuid4()),
+    "source_service": service,
+    "event_type":     event_type,
+    "user_id":        f"user_{random.randint(1, 200):04d}" if random.random() > 0.1 else None,
+    "session_id":     f"sess_{uuid.uuid4().hex[:16]}",
+    "occurred_at":    datetime.now(timezone.utc).isoformat(),
+    "client_ip":      fake.ipv4(),
+  }
 
-    # Event-specific payload
-    if event_type == "page_view":
-        pages = ["/", "/dashboard", "/settings", "/profile", "/reports", "/checkout", "/login"]
-        base["event_data"] = {
-            "page": random.choice(pages),
-            "referrer": random.choice(pages + [None]),
-            "time_on_page_ms": random.randint(100, 60000),
-            "viewport": {"width": 1920, "height": 1080},
-        }
+  if event_type == "page_view":
+    pages = ["/", "/dashboard", "/settings", "/profile", "/reports", "/checkout"]
+    base["event_data"] = {"page": random.choice(pages), "time_on_page_ms": random.randint(100, 60000)}
+  elif event_type == "button_click":
+    base["event_data"] = {"button": random.choice(["submit", "cancel", "export", "delete", "save"])}
+  elif event_type == "user_login":
+    base["event_data"] = {"method": random.choice(["password", "oauth_google", "sso"]), "success": random.random() > 0.05}
+  elif event_type == "purchase":
+    base["event_data"] = {"amount": round(random.uniform(9.99, 999.99), 2), "currency": random.choice(["USD", "EUR", "GBP"])}
+  elif event_type == "error":
+    codes = ["AUTH_TIMEOUT", "DB_CONNECTION_FAILED", "RATE_LIMITED", "INTERNAL_SERVER_ERROR"]
+    base["event_data"] = {"code": random.choice(codes), "severity": random.choice(["warning", "error", "critical"])}
+  elif event_type == "api_call":
+    base["event_data"] = {"endpoint": random.choice(["/v1/events", "/v1/users", "/v1/reports"]),
+                          "method": random.choice(["GET", "POST"]),
+                          "status_code": random.choice([200, 200, 200, 400, 500]),
+                          "latency_ms": random.randint(5, 2000)}
+  else:
+    base["event_data"] = {}
 
-    elif event_type == "button_click":
-        base["event_data"] = {
-            "button_id": random.choice(["submit", "cancel", "export", "delete", "save", "next"]),
-            "page": "/dashboard",
-            "x_pos": random.randint(0, 1920),
-            "y_pos": random.randint(0, 1080),
-        }
+  return base
 
-    elif event_type == "user_login":
-        base["event_data"] = {
-            "method": random.choice(["password", "oauth_google", "oauth_github", "sso"]),
-            "success": random.random() > 0.05,  # 95% success rate
-            "mfa_used": random.random() > 0.5,
-        }
-
-    elif event_type == "purchase":
-        base["event_data"] = {
-            "amount": round(random.uniform(9.99, 999.99), 2),
-            "currency": random.choice(["USD", "EUR", "GBP", "CAD"]),
-            "product_id": f"prod_{random.randint(1, 100):03d}",
-            "payment_method": random.choice(["credit_card", "paypal", "apple_pay"]),
-        }
-
-    elif event_type == "error":
-        error_codes = ["AUTH_TIMEOUT", "DB_CONNECTION_FAILED", "RATE_LIMITED",
-                      "INVALID_INPUT", "INTERNAL_SERVER_ERROR", "PAYMENT_DECLINED"]
-        base["event_data"] = {
-            "code": random.choice(error_codes),
-            "message": fake.sentence(),
-            "stack_trace": f"Error at {service}:{random.randint(10, 500)}",
-            "severity": random.choice(["warning", "error", "critical"]),
-        }
-
-    elif event_type == "api_call":
-        endpoints = ["/v1/events", "/v1/users", "/v1/reports", "/v1/export", "/v1/stats"]
-        methods = ["GET", "POST", "PUT", "DELETE"]
-        base["event_data"] = {
-            "endpoint": random.choice(endpoints),
-            "method": random.choice(methods),
-            "status_code": random.choice([200, 200, 200, 201, 400, 401, 404, 500]),
-            "latency_ms": random.randint(5, 2000),
-        }
-
-    else:
-        base["event_data"] = {}
-
-    return base
-
-
-# ============================================================
-# RABBITMQ CONNECTION
-# ============================================================
 
 def create_connection() -> pika.BlockingConnection:
-    """
-    Create a RabbitMQ connection with retry logic.
-    
-    pika.BlockingConnection is simple but blocks the thread.
-    For production with high throughput, you'd use
-    pika.SelectConnection (async) or a different library.
-    
-    We use connection parameters with heartbeat to detect
-    dead connections quickly.
-    """
-    credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
-    parameters = pika.ConnectionParameters(
-        host=RABBITMQ_HOST,
-        port=RABBITMQ_PORT,
-        virtual_host=RABBITMQ_VHOST,
-        credentials=credentials,
-        # Heartbeat: how often to ping RabbitMQ to detect dead connections
-        # 60 seconds is a good balance between sensitivity and overhead
-        heartbeat=60,
-        # How long to wait for a connection (seconds)
-        blocked_connection_timeout=300,
-    )
-    return pika.BlockingConnection(parameters)
+  credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
+  parameters = pika.ConnectionParameters(
+    host=RABBITMQ_HOST, port=RABBITMQ_PORT,
+    virtual_host=RABBITMQ_VHOST, credentials=credentials,
+    heartbeat=60, blocked_connection_timeout=300,
+  )
+  return pika.BlockingConnection(parameters)
 
-
-def setup_channel(connection: pika.BlockingConnection) -> pika.adapters.blocking_connection.BlockingChannel:
-    """Set up channel with exchange declaration."""
-    channel = connection.channel()
-    
-    # Declare exchange (idempotent — safe to call multiple times)
-    # durable=True: exchange survives RabbitMQ restart
-    channel.exchange_declare(
-        exchange=EXCHANGE,
-        exchange_type="direct",
-        durable=True,
-    )
-    
-    # Publisher confirms: RabbitMQ sends an ACK when it receives our message
-    # Without this, we're sending fire-and-forget with no guarantee
-    # of delivery. In production, ALWAYS use publisher confirms.
-    channel.confirm_delivery()
-    
-    return channel
-
-
-# ============================================================
-# MAIN PRODUCER LOOP
-# ============================================================
 
 class EventProducer:
-    def __init__(self):
-        self.connection: Optional[pika.BlockingConnection] = None
-        self.channel = None
-        self.running = False
-        self.events_sent = 0
-        self.errors = 0
-        
-        # Handle graceful shutdown on SIGTERM/SIGINT
-        # In Docker/Kubernetes, SIGTERM is sent before SIGKILL
-        # giving us time to finish processing and close connections
-        signal.signal(signal.SIGTERM, self._handle_shutdown)
-        signal.signal(signal.SIGINT, self._handle_shutdown)
+  def __init__(self):
+    self.connection: Optional[pika.BlockingConnection] = None
+    self.channel = None
+    self.running = False
+    self.events_sent = 0
+    self.errors = 0
+    signal.signal(signal.SIGTERM, self._handle_shutdown)
+    signal.signal(signal.SIGINT, self._handle_shutdown)
 
-    def _handle_shutdown(self, signum, frame):
-        print(f"\n🛑 Received signal {signum}. Shutting down gracefully...")
-        self.running = False
+  def _handle_shutdown(self, signum, frame):
+    print(f"\n🛑 Shutting down gracefully...")
+    self.running = False
 
-    def connect(self):
-        """Connect with exponential backoff retry."""
-        max_retries = 10
-        for attempt in range(max_retries):
-            try:
-                print(f"🔌 Connecting to RabbitMQ at {RABBITMQ_HOST}:{RABBITMQ_PORT}...")
-                self.connection = create_connection()
-                self.channel = setup_channel(self.connection)
-                print("✅ Connected to RabbitMQ!")
-                return
-            except Exception as e:
-                wait = min(2 ** attempt, 30)  # Exponential backoff, max 30s
-                print(f"❌ Connection failed (attempt {attempt+1}/{max_retries}): {e}")
-                print(f"⏳ Retrying in {wait}s...")
-                time.sleep(wait)
-        
-        print("💥 Could not connect to RabbitMQ after max retries. Exiting.")
-        sys.exit(1)
+  def _declare_topology(self):
+    """
+    Declare the full RabbitMQ topology:
+      dead letter exchange → dead letter queue
+      main exchange → main queue (with dead letter config)
+      binding: main exchange + routing key → main queue
 
-    def publish_event(self, event: dict) -> bool:
-        """
-        Publish a single event to RabbitMQ.
-        
-        We serialize to JSON and set content_type so consumers
-        know how to deserialize. persistent=2 means the message
-        is written to disk (survives broker restart).
-        """
-        try:
-            payload = json.dumps(event, default=str)
-            
-            self.channel.basic_publish(
-                exchange=EXCHANGE,
-                routing_key=ROUTING_KEY,
-                body=payload,
-                properties=pika.BasicProperties(
-                    content_type="application/json",
-                    delivery_mode=2,  # Persistent (survives restart)
-                    message_id=event["id"],
-                    timestamp=int(time.time()),
-                ),
-                mandatory=True,  # Raise error if no queue is bound
-            )
-            return True
-        
-        except pika.exceptions.UnroutableError:
-            print(f"⚠️  Message unroutable — is a queue bound to the exchange?")
-            return False
-        except Exception as e:
-            print(f"❌ Publish failed: {e}")
-            return False
+    WHY the producer does this too:
+      The Elixir consumer also declares this topology.
+      RabbitMQ declare operations are IDEMPOTENT — declaring
+      something that already exists with the same args is a no-op.
+      This means whoever starts first sets up the topology,
+      and the second one just confirms it's already there.
 
-    def run(self):
-        """Main production loop."""
+      Without this, if the producer starts before Elixir,
+      messages publish to the exchange but have no queue to
+      route to → "Message unroutable" warning → messages dropped.
+    """
+
+    # Step 1: Dead letter exchange
+    # Failed/rejected messages go here instead of being lost
+    self.channel.exchange_declare(
+      exchange=DEAD_LETTER_EX,
+      exchange_type="direct",
+      durable=True    # survives RabbitMQ restart
+    )
+
+    # Step 2: Dead letter queue
+    self.channel.queue_declare(
+      queue=DEAD_LETTER_Q,
+      durable=True
+    )
+
+    # Step 3: Bind dead letter queue to dead letter exchange
+    self.channel.queue_bind(
+      queue=DEAD_LETTER_Q,
+      exchange=DEAD_LETTER_EX,
+      routing_key=ROUTING_KEY
+    )
+
+    # Step 4: Main exchange — where producer publishes to
+    self.channel.exchange_declare(
+      exchange=EXCHANGE,
+      exchange_type="direct",
+      durable=True
+    )
+
+    # Step 5: Main queue with dead letter routing
+    # x-dead-letter-exchange: where NACKed messages go
+    # x-message-ttl: auto-expire messages after 24h if unprocessed
+    self.channel.queue_declare(
+      queue=QUEUE,
+      durable=True,
+      arguments={
+        "x-dead-letter-exchange":    DEAD_LETTER_EX,
+        "x-dead-letter-routing-key": ROUTING_KEY,
+        "x-message-ttl":             86400000,  # 24 hours in milliseconds
+      }
+    )
+
+    # Step 6: THE CRITICAL BINDING — this is what was missing
+    # Without this, exchange receives messages but has
+    # no rule for where to send them → unroutable
+    #
+    # This binding says:
+    # "messages arriving at EXCHANGE with ROUTING_KEY → go to QUEUE"
+    self.channel.queue_bind(
+      queue=QUEUE,
+      exchange=EXCHANGE,
+      routing_key=ROUTING_KEY
+    )
+
+    print("✅ Topology declared (exchange → binding → queue)")
+
+  def connect(self):
+    for attempt in range(10):
+      try:
+        print(f"🔌 Connecting to RabbitMQ at {RABBITMQ_HOST}:{RABBITMQ_PORT} (vhost: {RABBITMQ_VHOST})...")
+        self.connection = create_connection()
+        self.channel = self.connection.channel()
+
+        # Declare full topology before publishing anything
+        self._declare_topology()
+
+        # Confirm delivery — if a message is unroutable,
+        # pika raises an exception instead of silently dropping it
+        self.channel.confirm_delivery()
+
+        print("✅ Connected!")
+        return
+
+      except Exception as e:
+        wait = min(2 ** attempt, 30)
+        print(f"❌ Failed (attempt {attempt+1}): {e}. Retrying in {wait}s...")
+        time.sleep(wait)
+    sys.exit(1)
+
+  def publish(self, event: dict) -> bool:
+    try:
+      self.channel.basic_publish(
+        exchange=EXCHANGE, routing_key=ROUTING_KEY,
+        body=json.dumps(event, default=str),
+        properties=pika.BasicProperties(
+          content_type="application/json",
+          delivery_mode=2,           # persistent — survives RabbitMQ restart
+          message_id=event["id"],
+        ),
+        mandatory=True,              # raise error if unroutable (don't silently drop)
+      )
+      return True
+    except pika.exceptions.UnroutableError:
+      # This should no longer happen now that topology is declared
+      # But handle it explicitly so we know if something is wrong
+      print(f"⚠️  Message unroutable — check exchange/queue binding")
+      return False
+    except Exception as e:
+      print(f"❌ Publish failed: {e}")
+      return False
+
+  def run(self):
+    self.connect()
+    self.running = True
+    interval = 1.0 / EVENTS_PER_SECOND
+    print(f"🚀 Producing {EVENTS_PER_SECOND} events/second...")
+
+    while self.running:
+      try:
+        service    = random.choice(SERVICES)
+        event_type = random.choices(EVENT_TYPES, weights=EVENT_WEIGHTS, k=1)[0]
+        event      = generate_event(event_type, service)
+
+        if self.publish(event):
+          self.events_sent += 1
+          if self.events_sent % 100 == 0:
+            print(f"📊 Sent {self.events_sent} | Errors: {self.errors}")
+        else:
+          self.errors += 1
+
+        time.sleep(interval)
+
+      except pika.exceptions.AMQPConnectionError:
+        print("🔄 Reconnecting...")
         self.connect()
-        self.running = True
-        
-        interval = 1.0 / EVENTS_PER_SECOND
-        
-        print(f"🚀 Starting event production at {EVENTS_PER_SECOND} events/second")
-        print(f"   Exchange: {EXCHANGE}")
-        print(f"   Press Ctrl+C to stop\n")
-        
-        while self.running:
-            try:
-                # Pick a random service and event type
-                service = random.choice(SERVICES)
-                event_type = random.choices(EVENT_TYPES, weights=EVENT_WEIGHTS, k=1)[0]
-                
-                # Generate the event
-                event = generate_event_data(event_type, service)
-                
-                # Publish it
-                if self.publish_event(event):
-                    self.events_sent += 1
-                    if self.events_sent % 100 == 0:
-                        print(f"📊 Sent {self.events_sent} events | Errors: {self.errors}")
-                else:
-                    self.errors += 1
-                
-                # Sleep to maintain our target rate
-                time.sleep(interval)
-                
-            except pika.exceptions.AMQPConnectionError:
-                print("🔄 Connection lost. Reconnecting...")
-                self.connect()
-            
-            except Exception as e:
-                print(f"❌ Unexpected error: {e}")
-                self.errors += 1
-                time.sleep(1)
-        
-        # Graceful shutdown
-        print(f"\n📈 Final stats: {self.events_sent} events sent, {self.errors} errors")
-        if self.connection and not self.connection.is_closed:
-            self.connection.close()
-            print("🔌 RabbitMQ connection closed.")
+      except Exception as e:
+        print(f"❌ Error: {e}")
+        self.errors += 1
+        time.sleep(1)
+
+    print(f"📈 Done. Sent: {self.events_sent}, Errors: {self.errors}")
+    if self.connection and not self.connection.is_closed:
+      self.connection.close()
 
 
 if __name__ == "__main__":
-    producer = EventProducer()
-    producer.run()
+  EventProducer().run()
